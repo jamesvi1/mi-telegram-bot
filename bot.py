@@ -1,5 +1,8 @@
 import os
 import json
+import http.server
+import socketserver
+from threading import Thread
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -8,27 +11,33 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from flask import Flask
-from threading import Thread
+from dotenv import load_dotenv
 
-# Configurar Flask para el health check
-health_app = Flask(__name__)
+# Servidor HTTP simple para health checks
+class HealthHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot activo')
 
-@health_app.route('/')
-def home():
-    return "Bot activo", 200
+def run_health_server(port=5000):
+    with socketserver.TCPServer(("", port), HealthHandler) as httpd:
+        print(f"Health check en puerto {port}")
+        httpd.serve_forever()
 
-def run_health_app():
-    health_app.run(port=5000, host='0.0.0.0')
+# Cargar variables de entorno
+load_dotenv()  # Carga el archivo .env en la misma carpeta
+TOKEN = os.getenv('TELEGRAM_TOKEN')  # Usamos la variable aquí
 
 # Cargar respuestas desde JSON o crear nuevo si no existe
 def load_responses():
     try:
         # Intenta cargar desde archivo
-        with open('responses.json', 'r') as f:
+        with open('responses.json', 'r', encoding='utf-8') as f:
             return json.load(f)
-    except FileNotFoundError:
-        # Si no existe, crea uno básico
+    except (FileNotFoundError, json.JSONDecodeError):
+        # Si no existe o hay error, crea uno básico
         default_responses = {
             "default": "🤖 No entiendo ese mensaje",
             "hola": "¡Hola! ¿En qué puedo ayudarte?",
@@ -36,14 +45,13 @@ def load_responses():
             "gracias": "De nada, ¡estoy para servirte!"
         }
         # Guarda el archivo por primera vez
-        with open('responses.json', 'w') as f:
-            json.dump(default_responses, f, indent=2)
+        save_responses(default_responses)
         return default_responses
 
 # Guardar respuestas en JSON
 def save_responses(responses):
-    with open('responses.json', 'w') as f:
-        json.dump(responses, f, indent=2)
+    with open('responses.json', 'w', encoding='utf-8') as f:
+        json.dump(responses, f, indent=2, ensure_ascii=False)
 
 # Comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,6 +82,21 @@ async def edit_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
         parse_mode="Markdown"
     )
+
+# Comando para eliminar respuesta
+async def delete_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        keyword = context.args[0].lower()
+        responses = load_responses()
+        
+        if keyword in responses and keyword != "default":
+            del responses[keyword]
+            save_responses(responses)
+            await update.message.reply_text(f"✅ Respuesta para '{keyword}' eliminada!")
+        else:
+            await update.message.reply_text(f"❌ '{keyword}' no existe o no se puede eliminar")
+    except IndexError:
+        await update.message.reply_text("Debes especificar una palabra clave: /eliminar [palabra]")
 
 # Manejar nueva respuesta
 async def new_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,14 +136,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Modo edición
     if 'editing' in context.user_data:
         if ':' in user_text:
-            keyword, response = user_text.split(':', 1)
-            keyword = keyword.strip().lower()
-            
-            responses[keyword] = response.strip()
-            save_responses(responses)
-            
-            del context.user_data['editing']
-            await update.message.reply_text(f"✅ Respuesta para '{keyword}' guardada!")
+            parts = user_text.split(':', 1)
+            if len(parts) == 2:
+                keyword, response = parts
+                keyword = keyword.strip().lower()
+                
+                # Validar que la palabra clave no esté vacía
+                if keyword:
+                    responses[keyword] = response.strip()
+                    save_responses(responses)
+                    del context.user_data['editing']
+                    await update.message.reply_text(f"✅ Respuesta para '{keyword}' guardada!")
+                else:
+                    await update.message.reply_text("La palabra clave no puede estar vacía")
+            else:
+                await update.message.reply_text("Formato incorrecto. Usa: `palabra clave: respuesta`", parse_mode="Markdown")
         else:
             await update.message.reply_text("Formato incorrecto. Usa:\n`palabra clave: respuesta`", parse_mode="Markdown")
         return
@@ -130,7 +160,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyword = context.user_data['editing_key']
         responses[keyword] = user_text
         save_responses(responses)
-        
         del context.user_data['editing_key']
         await update.message.reply_text(f"✅ '{keyword}' actualizada!")
         return
@@ -144,11 +173,14 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error: {context.error}")
 
 def main():
-    # Obtener token de Telegram
-    TOKEN = os.getenv('TELEGRAM_TOKEN')
+    global TOKEN
+    
     if not TOKEN:
         print("ERROR: No se encontró TELEGRAM_TOKEN en las variables de entorno")
-        return
+        print("Por favor, crea un archivo .env con TELEGRAM_TOKEN=tu_token")
+        return None
+    
+    print(f"Token encontrado: {TOKEN[:5]}...")  # Muestra parte del token
     
     # Configurar aplicación
     application = Application.builder().token(TOKEN).build()
@@ -158,6 +190,7 @@ def main():
     application.add_handler(CommandHandler("edit", edit_responses))
     application.add_handler(CommandHandler("nueva", new_response))
     application.add_handler(CommandHandler("editar", edit_response))
+    application.add_handler(CommandHandler("eliminar", delete_response))  # Nuevo handler para eliminar
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     application.add_error_handler(error)
@@ -165,17 +198,26 @@ def main():
     return application
 
 if __name__ == '__main__':
-    # Iniciar el servidor de health check en un hilo separado
-    health_thread = Thread(target=run_health_app, daemon=True)
+    # Obtener puerto de Render o usar 5000 por defecto
+    port = int(os.environ.get('PORT', 5000))
+    print(f"Configurando health check en puerto {port}")
+    
+    # Iniciar servidor de health check en un hilo separado
+    health_thread = Thread(target=run_health_server, args=(port,), daemon=True)
     health_thread.start()
     
     # Iniciar el bot
     bot_app = main()
     
-    # Para Render: Obtener puerto de variable de entorno
-    port = int(os.environ.get('PORT', 5000))
-    print(f"Usando puerto: {port}")
-    
-    # Usar polling para recibir actualizaciones
-    bot_app.run_polling()
-    print("Bot en ejecución...")
+    if bot_app:
+        print("Iniciando bot...")
+        try:
+            bot_app.run_polling()
+            print("Bot en ejecución...")
+        except Exception as e:
+            print(f"Error al iniciar el bot: {e}")
+    else:
+        print("No se pudo iniciar el bot debido a la falta del token.")
+        # Esperar para que puedas ver el mensaje
+        import time
+        time.sleep(10)
