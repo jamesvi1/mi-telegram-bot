@@ -1,34 +1,51 @@
 import os
 import json
-from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes
+    ContextTypes,
+    filters
 )
-from telegram.ext import filters  # Cambio clave aquí
+from flask import Flask
+from threading import Thread
 
-# Cargar variables de entorno
-load_dotenv()
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-RESPONSES_FILE = 'responses.json'
+# Configurar Flask para el health check
+health_app = Flask(__name__)
 
-# Cargar respuestas desde JSON
+@health_app.route('/')
+def home():
+    return "Bot activo", 200
+
+def run_health_app():
+    health_app.run(port=5000, host='0.0.0.0')
+
+# Cargar respuestas desde JSON o crear nuevo si no existe
 def load_responses():
     try:
-        with open(RESPONSES_FILE, 'r') as f:
+        # Intenta cargar desde archivo
+        with open('responses.json', 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"default": "🤖 No entiendo ese mensaje"}
+        # Si no existe, crea uno básico
+        default_responses = {
+            "default": "🤖 No entiendo ese mensaje",
+            "hola": "¡Hola! ¿En qué puedo ayudarte?",
+            "adios": "¡Hasta pronto!",
+            "gracias": "De nada, ¡estoy para servirte!"
+        }
+        # Guarda el archivo por primera vez
+        with open('responses.json', 'w') as f:
+            json.dump(default_responses, f, indent=2)
+        return default_responses
 
 # Guardar respuestas en JSON
 def save_responses(responses):
-    with open(RESPONSES_FILE, 'w') as f:
+    with open('responses.json', 'w') as f:
         json.dump(responses, f, indent=2)
 
-# Comando /start (ahora async)
+# Comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_markdown_v2(
@@ -36,7 +53,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '\n\nUsa /edit para configurar respuestas'
     )
 
-# Comando /edit (ahora async)
+# Comando /edit - Interfaz de edición
 async def edit_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     responses = load_responses()
     keyboard = []
@@ -58,7 +75,7 @@ async def edit_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Manejar nueva respuesta (ahora async)
+# Manejar nueva respuesta
 async def new_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['editing'] = 'new'
     await update.message.reply_text(
@@ -69,7 +86,7 @@ async def new_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Editar respuesta existente (ahora async)
+# Editar respuesta existente
 async def edit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         keyword = context.args[0].lower()
@@ -88,7 +105,7 @@ async def edit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except IndexError:
         await update.message.reply_text("Debes especificar una palabra clave: /editar [palabra]")
 
-# Procesar mensajes de texto (ahora async)
+# Procesar mensajes de texto
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
     responses = load_responses()
@@ -122,12 +139,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = responses.get(user_text, responses['default'])
     await update.message.reply_text(response)
 
-# Manejar errores (ahora async)
+# Manejar errores
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error: {context.error}")
 
 def main():
-    # Configuración actualizada para v20.x
+    # Obtener token de Telegram
+    TOKEN = os.getenv('TELEGRAM_TOKEN')
+    if not TOKEN:
+        print("ERROR: No se encontró TELEGRAM_TOKEN en las variables de entorno")
+        return
+    
+    # Configurar aplicación
     application = Application.builder().token(TOKEN).build()
     
     # Handlers
@@ -138,9 +161,21 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     application.add_error_handler(error)
-
-    application.run_polling()
-    print("Bot en ejecución...")
+    
+    return application
 
 if __name__ == '__main__':
-    main()
+    # Iniciar el servidor de health check en un hilo separado
+    health_thread = Thread(target=run_health_app, daemon=True)
+    health_thread.start()
+    
+    # Iniciar el bot
+    bot_app = main()
+    
+    # Para Render: Obtener puerto de variable de entorno
+    port = int(os.environ.get('PORT', 5000))
+    print(f"Usando puerto: {port}")
+    
+    # Usar polling para recibir actualizaciones
+    bot_app.run_polling()
+    print("Bot en ejecución...")
